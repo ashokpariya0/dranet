@@ -351,6 +351,123 @@ func test_nsAttachNetdevRejectsAcceptRABelowIPv6MTU_Namespaced(t *testing.T) {
 	}
 }
 
+func Test_nsAttachNetdevRecoversFailedMove(t *testing.T) {
+	userns.Run(t, test_nsAttachNetdevRecoversFailedMove_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func test_nsAttachNetdevRecoversFailedMove_Namespaced(t *testing.T) {
+	tests := []struct {
+		name   string
+		config apis.InterfaceConfig
+		// missingNamespace points the attach at a namespace that does not exist.
+		missingNamespace bool
+	}{
+		{
+			// The kernel moves the device, then fails to rename it with EEXIST.
+			name:   "pod name already used in the namespace",
+			config: apis.InterfaceConfig{Name: "lo"},
+		},
+		{
+			// The kernel moves the device, then rejects the address with EADDRNOTAVAIL.
+			name:   "hardware address the device cannot use",
+			config: apis.InterfaceConfig{Name: "dranet0", HardwareAddr: ptr.To("01:00:5e:00:00:01")},
+		},
+		{
+			name:             "missing container namespace",
+			config:           apis.InterfaceConfig{Name: "dranet0"},
+			missingNamespace: true,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rndString := make([]byte, 4)
+			if _, err := rand.Read(rndString); err != nil {
+				t.Fatalf("fail to generate random name: %v", err)
+			}
+			nsName := fmt.Sprintf("ns%x", rndString)
+			containerNsPath := path.Join("/run/netns", nsName)
+			if !tt.missingNamespace {
+				origns, err := netns.Get()
+				if err != nil {
+					t.Fatalf("unexpected error trying to get namespace: %v", err)
+				}
+				defer origns.Close()
+				runtime.LockOSThread()
+				testNS, err := netns.NewNamed(nsName)
+				if err != nil {
+					runtime.UnlockOSThread()
+					t.Fatalf("Failed to create network namespace: %v", err)
+				}
+				setErr := netns.Set(origns)
+				runtime.UnlockOSThread()
+				if setErr != nil {
+					t.Fatalf("failed to switch back to the host namespace: %v", setErr)
+				}
+				t.Cleanup(func() {
+					testNS.Close()
+					_ = netns.DeleteNamed(nsName)
+				})
+			}
+
+			name := fmt.Sprintf("tmove%d-%x", i, rndString[:2])
+			la := netlink.NewLinkAttrs()
+			la.Name = name
+			link := &netlink.Dummy{LinkAttrs: la}
+			if err := netlink.LinkAdd(link); err != nil {
+				t.Fatalf("Failed to add dummy link %s: %v", name, err)
+			}
+			t.Cleanup(func() {
+				if link, err := nlwrap.LinkByName(name); err == nil {
+					_ = netlink.LinkDel(link)
+				}
+			})
+			if err := netlink.LinkSetUp(link); err != nil {
+				t.Fatalf("Failed to set up dummy link %s: %v", name, err)
+			}
+			before, err := nlwrap.LinkByName(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := nsAttachNetdev(name, containerNsPath, tt.config); err == nil {
+				t.Fatalf("nsAttachNetdev() succeeded, want an error")
+			}
+
+			// The device is back in the host namespace, under its own name, and up.
+			after, err := nlwrap.LinkByName(name)
+			if err != nil {
+				t.Fatalf("host device %s is gone after the failed attach: %v", name, err)
+			}
+			if after.Attrs().Flags&net.FlagUp == 0 {
+				t.Errorf("host device %s is down after the failed attach, flags=%v (before %v)", name, after.Attrs().Flags, before.Attrs().Flags)
+			}
+			if tt.missingNamespace {
+				return
+			}
+			nsHandle, err := netns.GetFromPath(containerNsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nsHandle.Close()
+			nhNs, err := nlwrap.NewHandleAt(nsHandle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nhNs.Close()
+			links, err := nhNs.LinkList()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, l := range links {
+				if l.Attrs().Name != "lo" {
+					t.Errorf("unexpected interface %s left in the container namespace", l.Attrs().Name)
+				}
+			}
+		})
+	}
+}
+
 // subscribeLinkEvents collects the netlink link events for one interface index
 // in the host namespace. Closing done stops the collection; the result channel
 // then receives the events seen up to that point.

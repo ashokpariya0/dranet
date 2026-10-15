@@ -45,28 +45,32 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 		return nil, fmt.Errorf("acceptRA requires an MTU of at least %d, but %s has MTU %d and the claim sets no mtu", apis.MinIPv6MTU, hostIfName, hostDev.Attrs().MTU)
 	}
 
-	// Devices can be renamed only when down
-	if err = netlink.LinkSetDown(hostDev); err != nil {
-		return nil, fmt.Errorf("failed to set %q down: %w", hostIfName, err)
-	}
-
+	// Open everything the move needs before the link is touched, so these
+	// failures leave the host device as it was.
 	containerNs, err := netns.GetFromPath(containerNsPAth)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get container network namespace %s: %w", containerNsPAth, err)
 	}
 	defer containerNs.Close()
 
-	attrs := hostDev.Attrs()
-
-	// copy from netlink.LinkModify(dev) using only the parts needed
-	flags := unix.NLM_F_REQUEST | unix.NLM_F_ACK
-	req := nl.NewNetlinkRequest(unix.RTM_NEWLINK, flags)
 	// Get a netlink socket in current namespace
 	s, err := nl.GetNetlinkSocketAt(netns.None(), netns.None(), unix.NETLINK_ROUTE)
 	if err != nil {
 		return nil, fmt.Errorf("could not get network namespace handle: %w", err)
 	}
 	defer s.Close()
+
+	attrs := hostDev.Attrs()
+	hostWasUp := attrs.Flags&net.FlagUp != 0
+
+	// Devices can be renamed only when down
+	if err = netlink.LinkSetDown(hostDev); err != nil {
+		return nil, fmt.Errorf("failed to set %q down: %w", hostIfName, err)
+	}
+
+	// copy from netlink.LinkModify(dev) using only the parts needed
+	flags := unix.NLM_F_REQUEST | unix.NLM_F_ACK
+	req := nl.NewNetlinkRequest(unix.RTM_NEWLINK, flags)
 
 	req.Sockets = map[int]*nl.SocketHandle{
 		unix.NETLINK_ROUTE: {Socket: s},
@@ -127,7 +131,11 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 
 	_, err = req.Execute(unix.NETLINK_ROUTE, 0)
 	if err != nil && !errors.Is(err, netlink.ErrDumpInterrupted) {
-		return nil, fmt.Errorf("failed to move interface %s to container namespace %s: %w", hostIfName, containerNsPAth, err)
+		moveErr := fmt.Errorf("failed to move interface %s to container namespace %s: %w", hostIfName, containerNsPAth, err)
+		if recoverErr := recoverFailedMove(containerNs, containerNsPAth, hostIfName, ifName, attrs.Index, hostWasUp); recoverErr != nil {
+			return nil, errors.Join(moveErr, recoverErr)
+		}
+		return nil, moveErr
 	}
 
 	// to avoid golang problem with goroutines we create the socket in the
@@ -174,6 +182,52 @@ func nsAttachNetdev(hostIfName string, containerNsPAth string, interfaceConfig a
 	}
 
 	return networkData, nil
+}
+
+// recoverFailedMove returns a host device to its original state after the
+// request that moves it into the container namespace failed.
+//
+// The kernel applies the namespace change before the other attributes of the
+// request (name, MTU, hardware address, ...). If one of those is rejected, for
+// example a name that already exists in the container namespace or an address
+// the device cannot use, the request returns an error but the device has
+// already been moved, still under its host name. Nothing would move it back:
+// the pod teardown looks it up under the name it was supposed to get.
+func recoverFailedMove(containerNs netns.NsHandle, containerNsPath, hostIfName, podIfName string, hostIndex int, hostWasUp bool) error {
+	// The device never left the host namespace: undo the LinkSetDown.
+	if hostDev, err := nlwrap.LinkByName(hostIfName); err == nil {
+		if !hostWasUp {
+			return nil
+		}
+		if err := netlink.LinkSetUp(hostDev); err != nil {
+			return fmt.Errorf("failed to set %q up after the failed move: %w", hostIfName, err)
+		}
+		return nil
+	}
+
+	nhNs, err := nlwrap.NewHandleAt(containerNs)
+	if err != nil {
+		return fmt.Errorf("failed to get netlink handle in container namespace %s: %w", containerNsPath, err)
+	}
+	defer nhNs.Close()
+
+	// The rename is applied after the namespace change, so the device normally
+	// keeps its host name. Only accept the pod name for the same device, since
+	// that name may belong to another interface of the pod (e.g. "lo").
+	devName := ""
+	if _, err := nhNs.LinkByName(hostIfName); err == nil {
+		devName = hostIfName
+	} else if link, err := nhNs.LinkByName(podIfName); err == nil && link.Attrs().Index == hostIndex {
+		devName = podIfName
+	}
+	if devName == "" {
+		return fmt.Errorf("interface %s not found in the host or in container namespace %s after the failed move", hostIfName, containerNsPath)
+	}
+	klog.Infof("Moving interface %s back from namespace %s after the failed move", hostIfName, containerNsPath)
+	if err := nsDetachNetdevFromNS(containerNs, containerNsPath, devName, hostIfName); err != nil {
+		return fmt.Errorf("failed to move interface %s back to the host after the failed move: %w", hostIfName, err)
+	}
+	return nil
 }
 
 func nsDetachNetdev(containerNsPAth string, devName string, outName string) error {
