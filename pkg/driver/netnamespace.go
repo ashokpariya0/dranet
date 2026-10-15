@@ -274,7 +274,19 @@ func applyVRFConfig(containerNsPath string, ifName string, vrfConfig *apis.VRFCo
 	vrfTable := uint32(*vrfConfig.Table)
 
 	vrfLink, err := nhNs.LinkByName(vrfName)
-	if err != nil {
+	if err == nil {
+		// The VRF exists already, typically because another interface of the
+		// pod joined it. Reuse it only if it is a VRF with the configured table:
+		// the routes of this interface are installed in the configured table, and
+		// a VRF looking up another table would silently never use them.
+		existing, ok := vrfLink.(*netlink.Vrf)
+		if !ok {
+			return 0, fmt.Errorf("cannot use %s as vrf for %s: an interface of type %s with that name already exists", vrfName, ifName, vrfLink.Type())
+		}
+		if existing.Table != vrfTable {
+			return 0, fmt.Errorf("vrf %s already exists with table %d, but table %d is configured for %s", vrfName, existing.Table, vrfTable, ifName)
+		}
+	} else {
 		vrfReq := &netlink.Vrf{
 			LinkAttrs: netlink.LinkAttrs{Name: vrfName},
 			Table:     vrfTable,

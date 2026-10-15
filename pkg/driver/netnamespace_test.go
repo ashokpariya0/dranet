@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -138,6 +139,96 @@ func test_applyRoutingConfig_Namespaced(t *testing.T) {
 		}
 		if !found {
 			t.Errorf("route %s not found in namespace", want.Destination)
+		}
+	}
+}
+
+func Test_applyVRFConfigReusesOnlyMatchingVRF(t *testing.T) {
+	userns.Run(t, test_applyVRFConfigReusesOnlyMatchingVRF_Namespaced, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func test_applyVRFConfigReusesOnlyMatchingVRF_Namespaced(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origns, err := netns.Get()
+	if err != nil {
+		t.Fatalf("unexpected error trying to get namespace: %v", err)
+	}
+	defer origns.Close()
+
+	rndString := make([]byte, 4)
+	if _, err := rand.Read(rndString); err != nil {
+		t.Fatalf("fail to generate random name: %v", err)
+	}
+	nsName := fmt.Sprintf("ns%x", rndString)
+	containerNsPath := path.Join("/run/netns", nsName)
+	testNS, err := netns.NewNamed(nsName)
+	if err != nil {
+		t.Fatalf("Failed to create network namespace: %v", err)
+	}
+	defer netns.DeleteNamed(nsName)
+	defer testNS.Close()
+	if err := netns.Set(origns); err != nil {
+		t.Fatalf("failed to restore original network namespace: %v", err)
+	}
+
+	nhNs, err := nlwrap.NewHandleAt(testNS)
+	if err != nil {
+		t.Fatalf("fail to open netlink handle: %v", err)
+	}
+	defer nhNs.Close()
+
+	// Interfaces of one pod, as dranet would have moved them in.
+	for _, name := range []string{"eth1", "eth2", "eth3", "eth4"} {
+		la := netlink.NewLinkAttrs()
+		la.Name = name
+		la.Namespace = netlink.NsFd(int(testNS))
+		if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: la}); err != nil {
+			t.Fatalf("Failed to add dummy link %s: %v", name, err)
+		}
+	}
+
+	table := func(n int) *int { return &n }
+
+	// eth1 creates the VRF.
+	got, err := applyVRFConfig(containerNsPath, "eth1", &apis.VRFConfig{Name: "blue", Table: table(100)})
+	if err != nil {
+		if strings.Contains(err.Error(), "failed to add vrf") {
+			t.Skipf("vrf devices are not supported here: %v", err)
+		}
+		t.Fatalf("applyVRFConfig(eth1) error = %v", err)
+	}
+	if got != 100 {
+		t.Fatalf("applyVRFConfig(eth1) table = %d, want 100", got)
+	}
+
+	// eth2 joins it with the same table.
+	if got, err := applyVRFConfig(containerNsPath, "eth2", &apis.VRFConfig{Name: "blue", Table: table(100)}); err != nil || got != 100 {
+		t.Errorf("applyVRFConfig(eth2, same table) = %d, %v; want 100, nil", got, err)
+	}
+
+	// eth3 asks for the same VRF with another table: its routes would go to
+	// table 200 while the VRF looks up table 100.
+	if _, err := applyVRFConfig(containerNsPath, "eth3", &apis.VRFConfig{Name: "blue", Table: table(200)}); err == nil ||
+		!strings.Contains(err.Error(), "vrf blue already exists with table 100, but table 200 is configured for eth3") {
+		t.Errorf("applyVRFConfig(eth3, other table) error = %v, want a table mismatch error", err)
+	}
+
+	// eth4 names an interface that is not a VRF.
+	if _, err := applyVRFConfig(containerNsPath, "eth4", &apis.VRFConfig{Name: "eth1", Table: table(300)}); err == nil ||
+		!strings.Contains(err.Error(), "cannot use eth1 as vrf for eth4") {
+		t.Errorf("applyVRFConfig(eth4, non-vrf name) error = %v, want a non-vrf error", err)
+	}
+
+	// Neither rejected interface was enslaved.
+	for _, name := range []string{"eth3", "eth4"} {
+		link, err := nhNs.LinkByName(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if link.Attrs().MasterIndex != 0 {
+			t.Errorf("%s was enslaved to master index %d after the rejection", name, link.Attrs().MasterIndex)
 		}
 	}
 }
