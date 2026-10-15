@@ -457,6 +457,53 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name:      "IPv6 address with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"2001:db8::1/64"}, MTU: ptr.To[int32](1279)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name:      "IPv6 address with mtu at the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"2001:db8::1/64"}, MTU: ptr.To[int32](1280)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "IPv6 address without mtu",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"2001:db8::1/64"}},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "IPv4 address with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"10.0.0.1/24"}, MTU: ptr.To[int32](1000)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "dual-stack addresses with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"10.0.0.1/24", "2001:db8::1/64", "fd00::1/64"}, MTU: ptr.To[int32](1000)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  2,
+		},
+		{
+			// The driver adds an IPv4-mapped address as IPv4 (net.IP.To4 is non-nil),
+			// so it must not trigger the IPv6 MTU check.
+			name:      "IPv4-mapped IPv6 address with mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", Addresses: []string{"::ffff:10.0.0.1/120"}, MTU: ptr.To[int32](1000)},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name:      "ipvlan with IPv6 address and mtu below the IPv6 minimum",
+			cfg:       &InterfaceConfig{Name: "eth0", Type: InterfaceTypeIPVLAN, Addresses: []string{"2001:db8::1/64"}, MTU: ptr.To[int32](1200)},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
 			name:      "multiple errors",
 			cfg:       &InterfaceConfig{Name: "eth/0", Addresses: []string{"badip"}, MTU: ptr.To[int32](0)},
 			fieldPath: "iface",

@@ -184,8 +184,15 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 	allErrors = append(allErrors, isValidLinuxInterfaceName(cfg.Name, fieldPath+".name")...)
 
 	for i, addr := range cfg.Addresses {
-		if _, err := netip.ParsePrefix(addr); err != nil {
+		prefix, err := netip.ParsePrefix(addr)
+		if err != nil {
 			allErrors = append(allErrors, fmt.Errorf("%s.addresses[%d]: invalid IP CIDR format '%s': %w", fieldPath, i, addr, err))
+			continue
+		}
+		// The kernel creates no IPv6 settings below this MTU, so it rejects
+		// adding an IPv6 address with EINVAL when the interface is configured.
+		if prefix.Addr().Is6() && !prefix.Addr().Is4In6() && cfg.MTU != nil && *cfg.MTU < MinIPv6MTU {
+			allErrors = append(allErrors, fmt.Errorf("%s.addresses[%d]: IPv6 address '%s' requires an mtu of at least %d, got %d", fieldPath, i, addr, MinIPv6MTU, *cfg.MTU))
 		}
 	}
 
